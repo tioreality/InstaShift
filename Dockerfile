@@ -33,17 +33,17 @@ COPY --from=builder /install /usr/local
 # Copy source code
 COPY bot/ ./bot/
 
-# ⚠️ LÍNEA ELIMINADA: VOLUME ["/app/data"]  <-- ESTO YA NO DEBE ESTAR
+# NOTA: VOLUME eliminado para compatibilidad con Railway
 
-# Non-root user for security
-RUN addgroup --system botuser && adduser --system --ingroup botuser botuser
-USER botuser
+# Ejecutar como root (necesario para Railway sin volumen)
+# Si quieres usar volumen, descomenta las líneas de abajo y comenta USER root
+USER root
 
 # Environment defaults (override with docker run -e or .env)
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    DB_PATH=/app/data/instashift.db \
-    SESSION_PATH=/app/data/ig_session.json \
+    DB_PATH=/app/instashift.db \
+    SESSION_PATH=/app/ig_session.json \
     LOG_LEVEL=INFO
 
 CMD ["python", "-m", "bot.main"]
