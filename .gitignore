@@ -1,0 +1,54 @@
+# ── Python ──────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+lib/
+lib64/
+sdist/
+var/
+wheels/
+*.egg-info
+.installed.cfg
+MANIFEST
+
+# ── Virtual Environments ─────────────────────────
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+.python-version
+
+# ── InstaShift Specific ──────────────────────────
+ig_session.json
+instashift.db
+*.db
+*.sqlite3
+logs/
+*.log
+
+# ── IDE / Editor ─────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ── Docker ───────────────────────────────────────
+docker-compose.override.yml
+
+# ── Secrets (never commit!) ──────────────────────
+.env
+.env.local
+.env.*.local
+secrets.json
+credentials.json
