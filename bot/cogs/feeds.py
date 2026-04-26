@@ -1,17 +1,17 @@
 """
 feeds.py – InstaShift
 ======================
-All subscription-management slash commands.
+Comandos de slash para gestionar suscripciones de feeds de Instagram.
 
-Commands
---------
-/follow      – Subscribe a channel to an Instagram account
-/unfollow    – Remove a subscription
-/list        – Show active feeds in this server
-/dashboard   – Rich embed overview of all feeds
-/checknow    – Force an immediate feed check
-/sync        – Re-sync slash commands (admin)
-/sync clear  – Remove all slash commands (admin)
+Comandos disponibles
+--------------------
+/follow      – Suscribir un canal a una cuenta de Instagram
+/unfollow    – Eliminar una suscripción
+/list        – Ver los feeds activos en este servidor
+/dashboard   – Vista general rica con todos los feeds
+/checknow    – Forzar una verificación inmediata de feeds
+/sync        – Re-sincronizar comandos slash (admin)
+/sync clear  – Eliminar todos los comandos slash (admin)
 """
 
 from __future__ import annotations
@@ -25,29 +25,37 @@ from discord.ext import commands
 
 from bot.database import add_feed, get_feeds, remove_feed
 
+# ── Logger del módulo ─────────────────────────────────────────────────────────
 log = logging.getLogger(__name__)
 
-# Instagram brand pink
-IG_COLOR = 0xE1306C
-SUCCESS_COLOR = 0x00B06B
-ERROR_COLOR = 0xFF4444
-INFO_COLOR = 0x5865F2
+# ── Paleta de colores para embeds ─────────────────────────────────────────────
+IG_COLOR = 0xE1306C      # Rosa Instagram
+SUCCESS_COLOR = 0x00B06B  # Verde éxito
+ERROR_COLOR = 0xFF4444    # Rojo error
+INFO_COLOR = 0x5865F2     # Azul Discord
 
 
-def _feed_to_line(idx: int, feed: dict) -> str:
-    """Format a single feed row for list/dashboard embeds."""
-    channel = f"<#{feed['channel_id']}>"
-    thread = f" → <#{feed['thread_id']}>" if feed.get("thread_id") else ""
-    role = f" | <@&{feed['role_id']}>" if feed.get("role_id") else ""
-    return f"**{idx}.** [@{feed['instagram_account']}](https://instagram.com/{feed['instagram_account']}) {channel}{thread}{role}"
+def _formatear_feed(idx: int, feed: dict) -> str:
+    """
+    Formatea una fila de feed para mostrarla en /list o /dashboard.
+    Ejemplo: 1. @nasa → #general | @Noticias
+    """
+    canal = f"<#{feed['channel_id']}>"
+    hilo = f" → <#{feed['thread_id']}>" if feed.get("thread_id") else ""
+    rol = f"  |  <@&{feed['role_id']}>" if feed.get("role_id") else ""
+    return (
+        f"**{idx}.** "
+        f"[@{feed['instagram_account']}](https://instagram.com/{feed['instagram_account']}) "
+        f"{canal}{hilo}{rol}"
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Cog
+# Cog de gestión de feeds
 # ══════════════════════════════════════════════════════════════════════════════
 
 class FeedsCog(commands.Cog, name="Feeds"):
-    """Slash commands for managing Instagram → Discord feed subscriptions."""
+    """Comandos slash para gestionar suscripciones de Instagram → Discord."""
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
@@ -56,13 +64,13 @@ class FeedsCog(commands.Cog, name="Feeds"):
 
     @app_commands.command(
         name="follow",
-        description="Subscribe a channel to an Instagram account's posts.",
+        description="Suscribir un canal a las publicaciones de una cuenta de Instagram.",
     )
     @app_commands.describe(
-        username="Instagram username to follow (without @)",
-        channel="Discord channel to post updates in (defaults to current)",
-        thread="Optional thread to post in instead of the channel",
-        role="Optional role to mention on each new post",
+        username="Usuario de Instagram a seguir (sin @)",
+        channel="Canal de Discord donde se publicarán las actualizaciones (por defecto: canal actual)",
+        thread="Hilo opcional donde publicar en lugar del canal",
+        role="Rol opcional para mencionar en cada nueva publicación",
     )
     @app_commands.checks.has_permissions(manage_guild=True)
     async def follow(
@@ -73,18 +81,24 @@ class FeedsCog(commands.Cog, name="Feeds"):
         thread: Optional[discord.Thread] = None,
         role: Optional[discord.Role] = None,
     ) -> None:
+        """Agrega una nueva suscripción al feed de Instagram especificado."""
         await interaction.response.defer(ephemeral=True)
 
+        # Limpiar y normalizar el username
         username = username.lstrip("@").strip().lower()
         if not username:
-            await interaction.followup.send("❌ Invalid username.", ephemeral=True)
+            await interaction.followup.send("❌ El nombre de usuario no es válido.", ephemeral=True)
             return
 
+        # Determinar el canal de destino
         target_channel = channel or interaction.channel
         if not isinstance(target_channel, (discord.TextChannel, discord.Thread)):
-            await interaction.followup.send("❌ Please select a valid text channel.", ephemeral=True)
+            await interaction.followup.send(
+                "❌ Por favor selecciona un canal de texto válido.", ephemeral=True
+            )
             return
 
+        # Insertar la suscripción en la base de datos
         feed_id = await add_feed(
             guild_id=interaction.guild_id,
             instagram_account=username,
@@ -94,26 +108,29 @@ class FeedsCog(commands.Cog, name="Feeds"):
         )
 
         if not feed_id:
+            # La combinación ya existe (restricción UNIQUE en la BD)
             await interaction.followup.send(
-                f"⚠️ **@{username}** is already being followed in {target_channel.mention}.",
+                f"⚠️ **@{username}** ya está siendo seguido en {target_channel.mention}.",
                 ephemeral=True,
             )
             return
 
+        # Construir embed de confirmación
         embed = discord.Embed(
-            title="✅ Feed Added",
+            title="✅ Suscripción agregada",
             color=SUCCESS_COLOR,
             description=(
-                f"Now following **[@{username}](https://instagram.com/{username})**\n"
-                f"Posts will appear in {target_channel.mention}"
+                f"Ahora siguiendo **[@{username}](https://instagram.com/{username})**\n"
+                f"Las publicaciones aparecerán en {target_channel.mention}"
                 + (f" → {thread.mention}" if thread else "")
-                + (f"\nMention: {role.mention}" if role else "")
+                + (f"\nMención: {role.mention}" if role else "")
             ),
         )
-        embed.set_footer(text="Updates check every 10 minutes.")
+        embed.set_footer(text="Las actualizaciones se verifican cada 10 minutos.")
+
         await interaction.followup.send(embed=embed, ephemeral=True)
         log.info(
-            "[Feeds] Guild %s followed @%s → channel %s",
+            "[Feeds] Servidor %s: nueva suscripción @%s → canal %s",
             interaction.guild_id, username, target_channel.id,
         )
 
@@ -121,11 +138,11 @@ class FeedsCog(commands.Cog, name="Feeds"):
 
     @app_commands.command(
         name="unfollow",
-        description="Stop following an Instagram account in a channel.",
+        description="Dejar de seguir una cuenta de Instagram en un canal.",
     )
     @app_commands.describe(
-        username="Instagram username to unfollow (without @)",
-        channel="Channel to remove the subscription from (defaults to current)",
+        username="Usuario de Instagram a dejar de seguir (sin @)",
+        channel="Canal del que se elimina la suscripción (por defecto: canal actual)",
     )
     @app_commands.checks.has_permissions(manage_guild=True)
     async def unfollow(
@@ -134,178 +151,227 @@ class FeedsCog(commands.Cog, name="Feeds"):
         username: str,
         channel: Optional[discord.TextChannel] = None,
     ) -> None:
+        """Elimina una suscripción de feed existente."""
         await interaction.response.defer(ephemeral=True)
 
         username = username.lstrip("@").strip().lower()
         target_channel = channel or interaction.channel
 
-        deleted = await remove_feed(
+        # Eliminar de la base de datos
+        eliminado = await remove_feed(
             guild_id=interaction.guild_id,
             instagram_account=username,
             channel_id=target_channel.id,
         )
 
-        if deleted:
+        if eliminado:
             embed = discord.Embed(
-                title="🗑️ Feed Removed",
-                description=f"Stopped following **@{username}** in {target_channel.mention}.",
+                title="🗑️ Suscripción eliminada",
+                description=(
+                    f"Se dejó de seguir **@{username}** en {target_channel.mention}.\n"
+                    "Las publicaciones anteriores no serán eliminadas."
+                ),
                 color=ERROR_COLOR,
             )
         else:
             embed = discord.Embed(
-                title="⚠️ Not Found",
-                description=f"No active subscription for **@{username}** in {target_channel.mention}.",
+                title="⚠️ Suscripción no encontrada",
+                description=(
+                    f"No hay una suscripción activa de **@{username}** "
+                    f"en {target_channel.mention}.\n"
+                    "Usa **/list** para ver las suscripciones activas."
+                ),
                 color=INFO_COLOR,
             )
+
         await interaction.followup.send(embed=embed, ephemeral=True)
 
     # ── /list ─────────────────────────────────────────────────────────────────
 
     @app_commands.command(
         name="list",
-        description="List all active Instagram feed subscriptions in this server.",
+        description="Ver todas las suscripciones activas de Instagram en este servidor.",
     )
     @app_commands.checks.has_permissions(manage_guild=True)
     async def list_feeds(self, interaction: discord.Interaction) -> None:
+        """Muestra la lista compacta de todos los feeds activos en el servidor."""
         await interaction.response.defer(ephemeral=True)
 
         feeds = await get_feeds(interaction.guild_id)
         if not feeds:
             await interaction.followup.send(
-                "📭 No active subscriptions. Use **/follow** to add one.", ephemeral=True
+                "📭 No hay suscripciones activas.\nUsa **/follow** para agregar una.",
+                ephemeral=True,
             )
             return
 
-        lines = [_feed_to_line(i + 1, f) for i, f in enumerate(feeds)]
+        # Formatear cada feed como una línea
+        lineas = [_formatear_feed(i + 1, f) for i, f in enumerate(feeds)]
+
         embed = discord.Embed(
-            title=f"📋 Active Feeds ({len(feeds)})",
-            description="\n".join(lines),
+            title=f"📋 Suscripciones activas ({len(feeds)})",
+            description="\n".join(lineas),
             color=IG_COLOR,
         )
-        embed.set_footer(text="Use /unfollow to remove a subscription.")
+        embed.set_footer(text="Usa /unfollow para eliminar una suscripción.")
+
         await interaction.followup.send(embed=embed, ephemeral=True)
 
     # ── /dashboard ────────────────────────────────────────────────────────────
 
     @app_commands.command(
         name="dashboard",
-        description="Show a rich overview of all Instagram feeds for this server.",
+        description="Panel de control con la vista general de los feeds de Instagram.",
     )
     @app_commands.checks.has_permissions(manage_guild=True)
     async def dashboard(self, interaction: discord.Interaction) -> None:
+        """Vista rica con todos los feeds activos del servidor, visible para todos."""
         await interaction.response.defer(ephemeral=False)
 
         feeds = await get_feeds(interaction.guild_id)
         guild = interaction.guild
 
         embed = discord.Embed(
-            title="📊 InstaShift Dashboard",
+            title="📊 Panel de control – InstaShift",
             color=IG_COLOR,
         )
 
+        # Miniatura del servidor si tiene icono
         if guild and guild.icon:
             embed.set_thumbnail(url=guild.icon.url)
 
         if not feeds:
-            embed.description = "No active feeds. Use **/follow** to get started!"
+            embed.description = (
+                "No hay suscripciones activas en este servidor.\n"
+                "Usa **/follow** para comenzar a seguir cuentas de Instagram."
+            )
         else:
-            embed.description = f"**{len(feeds)}** active subscription{'s' if len(feeds) != 1 else ''} in **{guild.name if guild else 'this server'}**."
+            plural = "suscripciones" if len(feeds) != 1 else "suscripción"
+            embed.description = (
+                f"**{len(feeds)} {plural}** activas en "
+                f"**{guild.name if guild else 'este servidor'}**."
+            )
+
+            # Agregar cada feed como un campo del embed
             for feed in feeds:
-                channel = f"<#{feed['channel_id']}>"
-                thread = f" → <#{feed['thread_id']}>" if feed.get("thread_id") else ""
-                role = f"\nMention: <@&{feed['role_id']}>" if feed.get("role_id") else ""
-                last = feed.get("last_media_id") or "—"
+                canal = f"<#{feed['channel_id']}>"
+                hilo = f" → <#{feed['thread_id']}>" if feed.get("thread_id") else ""
+                rol = f"\n📢 Mención: <@&{feed['role_id']}>" if feed.get("role_id") else ""
+                ultimo = feed.get("last_media_id") or "—"
+
                 embed.add_field(
                     name=f"📸 @{feed['instagram_account']}",
-                    value=f"Channel: {channel}{thread}{role}\nLast seen: `{last[:20]}`",
+                    value=(
+                        f"Canal: {canal}{hilo}{rol}\n"
+                        f"Último visto: `{ultimo[:20]}`"
+                    ),
                     inline=True,
                 )
 
-        embed.set_footer(text="Updates check every 10 minutes • /checknow to force a check")
+        embed.set_footer(
+            text="Las actualizaciones se verifican cada 10 minutos  •  /checknow para verificar ahora"
+        )
+
         await interaction.followup.send(embed=embed)
 
     # ── /checknow ─────────────────────────────────────────────────────────────
 
     @app_commands.command(
         name="checknow",
-        description="Force an immediate check of all Instagram feeds.",
+        description="Forzar una verificación inmediata de todos los feeds de Instagram.",
     )
     @app_commands.checks.has_permissions(manage_guild=True)
     async def checknow(self, interaction: discord.Interaction) -> None:
+        """Ejecuta el loop de feeds de forma manual sin esperar al intervalo."""
         await interaction.response.defer(ephemeral=True)
 
-        # Trigger the scraper's feed loop manually
+        # Obtener el cog del scraper para ejecutar su loop manualmente
         scraper_cog = self.bot.cogs.get("Instagram")
         if scraper_cog is None:
-            await interaction.followup.send("❌ Scraper cog not loaded.", ephemeral=True)
+            await interaction.followup.send(
+                "❌ El módulo de scraping no está cargado. Reinicia el bot.",
+                ephemeral=True,
+            )
             return
 
         await interaction.followup.send(
-            "🔄 Checking feeds now… results will appear in their respective channels.",
+            "🔄 Verificando feeds ahora… Los resultados aparecerán en sus canales correspondientes.",
             ephemeral=True,
         )
-        # Run the feed loop task body directly (non-blocking)
+
+        # Lanzar el loop como tarea asíncrona para no bloquear el hilo principal
         self.bot.loop.create_task(scraper_cog.feed_loop())  # type: ignore[attr-defined]
 
     # ── /sync ─────────────────────────────────────────────────────────────────
 
     @app_commands.command(
         name="sync",
-        description="[Admin] Sync slash commands. Use 'clear' to wipe all commands.",
+        description="[Admin] Sincronizar comandos slash. Usa 'clear' para eliminarlos todos.",
     )
-    @app_commands.describe(mode="Leave empty to sync, type 'clear' to remove all commands.")
+    @app_commands.describe(
+        mode="Dejar vacío para sincronizar, escribir 'clear' para eliminar todos los comandos."
+    )
     @app_commands.checks.has_permissions(administrator=True)
     async def sync(
         self,
         interaction: discord.Interaction,
         mode: Optional[str] = None,
     ) -> None:
+        """Sincroniza o limpia los comandos slash del servidor."""
         await interaction.response.defer(ephemeral=True)
 
         if mode and mode.strip().lower() == "clear":
+            # Eliminar todos los comandos del servidor actual
             self.bot.tree.clear_commands(guild=interaction.guild)
             await self.bot.tree.sync(guild=interaction.guild)
             await interaction.followup.send(
-                "🧹 All guild commands cleared. Global commands may still be cached.",
+                "🧹 Todos los comandos del servidor fueron eliminados.\n"
+                "Los comandos globales pueden tardar hasta 1 hora en actualizarse.",
                 ephemeral=True,
             )
             return
 
-        # Smart sync: guild first, then global
+        # Sincronización inteligente: primero el servidor, luego global
         synced_guild = await self.bot.tree.sync(guild=interaction.guild)
         synced_global = await self.bot.tree.sync()
+
         await interaction.followup.send(
-            f"✅ Synced **{len(synced_guild)}** guild commands and "
-            f"**{len(synced_global)}** global commands.",
+            f"✅ Sincronizados **{len(synced_guild)}** comandos de servidor y "
+            f"**{len(synced_global)}** comandos globales.",
             ephemeral=True,
         )
         log.info(
-            "[Sync] %d guild + %d global commands synced by %s",
+            "[Sync] %d servidor + %d global sincronizados por %s",
             len(synced_guild), len(synced_global), interaction.user,
         )
 
-    # ── Error handlers ────────────────────────────────────────────────────────
+    # ── Manejador global de errores del cog ───────────────────────────────────
 
     async def cog_app_command_error(
         self,
         interaction: discord.Interaction,
         error: app_commands.AppCommandError,
     ) -> None:
+        """Captura y responde a errores de comandos slash de forma amigable."""
         if isinstance(error, app_commands.MissingPermissions):
-            msg = "❌ You need **Manage Server** permission to use this command."
+            msg = "❌ Necesitas el permiso **Gestionar servidor** para usar este comando."
         elif isinstance(error, app_commands.CommandOnCooldown):
-            msg = f"⏳ Cooldown! Retry in {error.retry_after:.1f}s."
+            msg = f"⏳ Comando en cooldown. Intenta de nuevo en {error.retry_after:.1f}s."
         elif isinstance(error, app_commands.BotMissingPermissions):
-            msg = "❌ I'm missing required permissions in this channel."
+            msg = "❌ Me faltan permisos necesarios en este canal para ejecutar el comando."
         else:
-            log.exception("Unhandled app command error: %s", error)
-            msg = f"❌ An unexpected error occurred: {error}"
+            log.exception("Error no manejado en comando slash: %s", error)
+            msg = f"❌ Ocurrió un error inesperado: `{error}`"
 
+        # Responder según si la interacción ya fue respondida o no
         if interaction.response.is_done():
             await interaction.followup.send(msg, ephemeral=True)
         else:
             await interaction.response.send_message(msg, ephemeral=True)
 
 
+# ── Función de configuración del cog ──────────────────────────────────────────
+
 async def setup(bot: commands.Bot) -> None:
+    """Registra el cog en el bot. Llamada automáticamente por load_extension()."""
     await bot.add_cog(FeedsCog(bot))
