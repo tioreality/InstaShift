@@ -17,6 +17,8 @@ Notas de mantenimiento
 * El cog se registra mediante setup() al final del archivo (requerido por load_extension)
 * FeedLoop se inicia en __init__ y se cancela en cog_unload para evitar memory leaks
 * El primer ciclo siempre marca sin publicar (anti-spam al arrancar)
+* discord.Embed.Empty fue eliminado en discord.py 2.0 — NO usar
+* asyncio.get_event_loop() deprecado en Python 3.10+ — usar get_running_loop()
 """
 
 from __future__ import annotations
@@ -31,16 +33,36 @@ from typing import Optional
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
-from instagrapi import Client
-from instagrapi.exceptions import (
-    BadPassword,
-    ChallengeRequired,
-    LoginRequired,
-    MediaNotFound,
-    ReloginAttemptExceeded,
-    UserNotFound,
-)
-from instagrapi.types import Media, UserShort
+
+# ── Importar instagrapi con manejo de error claro ───────────────────────────────────────────────
+# Si instagrapi no está instalado, el cog puede no cargar.
+# El error quedará visible en los logs con el mensaje de abajo.
+try:
+    from instagrapi import Client
+    from instagrapi.exceptions import (
+        BadPassword,
+        ChallengeRequired,
+        LoginRequired,
+        MediaNotFound,
+        ReloginAttemptExceeded,
+        UserNotFound,
+    )
+    from instagrapi.types import Media, UserShort
+    INSTAGRAPI_OK = True
+except ImportError as _instagrapi_err:
+    # Si falla la importación, el cog se registra igual pero avisa en los logs
+    # y todas las funciones de scraping devuelven resultados vacíos/None.
+    logging.getLogger(__name__).critical(
+        "[InstaShift] FALLO CRITICO: instagrapi no está instalado o tiene error. "
+        "Ejecuta: pip install instagrapi>=2.0.0,<3.0.0  |  Error: %s",
+        _instagrapi_err,
+    )
+    INSTAGRAPI_OK = False
+    # Tipos de fallback para que el módulo no falle al importar
+    Client = None  # type: ignore[misc,assignment]
+    BadPassword = ChallengeRequired = LoginRequired = Exception
+    MediaNotFound = ReloginAttemptExceeded = UserNotFound = Exception
+    Media = UserShort = object  # type: ignore[misc,assignment]
 
 from bot.database import (
     get_all_active_feeds,
@@ -64,10 +86,10 @@ CHECK_INTERVAL: int = int(os.getenv("CHECK_INTERVAL", "10"))
 # Color rosa Instagram (#E1306C) — borde izquierdo del embed
 IG_COLOR = 0xE1306C
 
-# Máximo de publicaciones a obtener por ciclo (para no saturar la API)
+# Máximo de publicaciones a obtener por ciclo
 MAX_POSTS_PER_CYCLE = 5
 
-# Máximo de hashtags clicables a mostrar en el embed
+# Máximo de hashtags clicables a mostrar en el embed (evita saturar el mensaje)
 MAX_HASHTAGS = 8
 
 
@@ -80,12 +102,12 @@ class InstagramClient:
     Wrapper thread-safe sobre instagrapi.Client con persistencia de sesión.
 
     Toda operación bloqueante de instagrapi se ejecuta en un executor
-    para no bloquear el event loop de asyncio.
+    para no bloquear el event loop de asyncio (compatible con discord.py).
     """
 
     def __init__(self) -> None:
-        # Cliente de instagrapi (operaciones sincónicas)
-        self._cl: Client = Client()
+        # Solo instanciar el cliente si instagrapi está disponible
+        self._cl = Client() if INSTAGRAPI_OK else None
         # Flag de estado de autenticación
         self._logged_in: bool = False
         # Lock para evitar logins concurrentes simultáneos
@@ -98,6 +120,8 @@ class InstagramClient:
         Intenta cargar la sesión guardada desde disco.
         Retorna True si la sesión se cargó y verificó correctamente.
         """
+        if not INSTAGRAPI_OK or self._cl is None:
+            return False
         if not SESSION_PATH.exists():
             return False
         try:
@@ -105,17 +129,19 @@ class InstagramClient:
             # Verificar que la sesión cargada sigue siendo válida
             self._cl.get_timeline_feed()
             self._logged_in = True
-            log.info("[IG] Sesión restaurada desde %s", SESSION_PATH)
+            log.info("[IG] ✅ Sesión restaurada desde %s", SESSION_PATH)
             return True
         except LoginRequired:
-            log.warning("[IG] Sesión expirada, se requiere re-login.")
+            log.warning("[IG] Sesión expirada, se necesita re-login.")
             return False
         except Exception as exc:
             log.warning("[IG] No se pudo restaurar la sesión: %s", exc)
             return False
 
     def _save_session(self) -> None:
-        """Persiste la sesión actual en disco para futuros reinicios."""
+        """Persiste la sesión actual en disco para futuros reinicios del bot."""
+        if self._cl is None:
+            return
         SESSION_PATH.parent.mkdir(parents=True, exist_ok=True)
         self._cl.dump_settings(SESSION_PATH)
         log.debug("[IG] Sesión guardada en %s", SESSION_PATH)
@@ -127,12 +153,16 @@ class InstagramClient:
         Garantiza que el cliente esté autenticado antes de hacer requests.
 
         Flujo:
-        1. Si ya está autenticado → retorna True inmediatamente.
-        2. Si hay sesión guardada válida → la restaura.
-        3. Si no → hace login fresco con usuario/contraseña.
-
-        Retorna True si el login fue exitoso, False si faltan credenciales.
+        1. Si instagrapi no está disponible → retorna False con log de error.
+        2. Si ya está autenticado → retorna True inmediatamente.
+        3. Si hay sesión guardada válida → la restaura.
+        4. Si no → hace login fresco con usuario/contraseña.
         """
+        # Verificar que instagrapi esté disponible
+        if not INSTAGRAPI_OK or self._cl is None:
+            log.error("[IG] instagrapi no disponible – no se puede autenticar.")
+            return False
+
         async with self._lock:
             # Ya autenticado — nada que hacer
             if self._logged_in:
@@ -140,10 +170,11 @@ class InstagramClient:
 
             # Sin credenciales → modo invitado (acceso limitado)
             if not IG_USERNAME or not IG_PASSWORD:
-                log.warning("[IG] Sin credenciales – operando en modo invitado (limitado).")
+                log.warning("[IG] Sin credenciales – operando en modo invitado.")
                 return False
 
-            loop = asyncio.get_event_loop()
+            # CORRECCION: usar get_running_loop() en lugar del deprecado get_event_loop()
+            loop = asyncio.get_running_loop()
 
             # 1. Intentar restaurar sesión guardada
             restored = await loop.run_in_executor(None, self._load_session)
@@ -159,46 +190,49 @@ class InstagramClient:
                 )
                 self._logged_in = True
                 await loop.run_in_executor(None, self._save_session)
-                log.info("[IG] Login exitoso.")
+                log.info("[IG] ✅ Login exitoso como @%s", IG_USERNAME)
                 return True
             except BadPassword:
-                log.error("[IG] Contraseña incorrecta para @%s.", IG_USERNAME)
+                log.error("[IG] ❌ Contraseña incorrecta para @%s. Revisa IG_PASSWORD.", IG_USERNAME)
             except ChallengeRequired:
-                log.error("[IG] Se requiere verificación de challenge (2FA u otro).")
+                log.error("[IG] ❌ Se requiere verificación (challenge/2FA). Resuelve manualmente.")
             except ReloginAttemptExceeded:
-                log.error("[IG] Demasiados intentos de re-login. Espera antes de reintentar.")
+                log.error("[IG] ❌ Demasiados intentos de re-login. Espera antes de reintentar.")
             except Exception as exc:
-                log.exception("[IG] Error inesperado durante el login: %s", exc)
+                log.exception("[IG] ❌ Error inesperado durante el login: %s", exc)
 
             return False
 
     # ── Obtención de datos ────────────────────────────────────────────────────────────────────────
 
-    async def get_user_info(self, username: str) -> Optional[UserShort]:
+    async def get_user_info(self, username: str) -> Optional[object]:
         """
         Obtiene la información básica de un perfil público.
-        Retorna None si hay error o el usuario no existe.
+        Retorna None si hay error, usuario no existe o instagrapi no está disponible.
         """
+        if not INSTAGRAPI_OK or self._cl is None:
+            return None
         await self.ensure_logged_in()
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         try:
-            user = await loop.run_in_executor(
+            return await loop.run_in_executor(
                 None, lambda: self._cl.user_info_by_username(username)
             )
-            return user
         except UserNotFound:
             log.warning("[IG] Usuario @%s no encontrado.", username)
         except Exception as exc:
             log.exception("[IG] Error al obtener info de @%s: %s", username, exc)
         return None
 
-    async def get_recent_medias(self, username: str, amount: int = 5) -> list[Media]:
+    async def get_recent_medias(self, username: str, amount: int = 5) -> list:
         """
         Obtiene las publicaciones más recientes de una cuenta pública.
-        Retorna lista vacía si hay error.
+        Retorna lista vacía si hay error o instagrapi no está disponible.
         """
+        if not INSTAGRAPI_OK or self._cl is None:
+            return []
         await self.ensure_logged_in()
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         try:
             user_id = await loop.run_in_executor(
                 None, lambda: self._cl.user_id_from_username(username)
@@ -210,26 +244,27 @@ class InstagramClient:
         except UserNotFound:
             log.warning("[IG] Usuario @%s no encontrado.", username)
         except MediaNotFound:
-            log.warning("[IG] No se encontraron publicaciones para @%s.", username)
+            log.warning("[IG] No hay publicaciones para @%s.", username)
         except Exception as exc:
             log.exception("[IG] Error al obtener publicaciones de @%s: %s", username, exc)
         return []
 
-    async def get_recent_stories(self, username: str) -> list[Media]:
+    async def get_recent_stories(self, username: str) -> list:
         """
         Obtiene las Stories actuales de un usuario (requiere autenticación).
-        Retorna lista vacía si hay error.
+        Retorna lista vacía si hay error o instagrapi no está disponible.
         """
+        if not INSTAGRAPI_OK or self._cl is None:
+            return []
         await self.ensure_logged_in()
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         try:
             user_id = await loop.run_in_executor(
                 None, lambda: self._cl.user_id_from_username(username)
             )
-            stories = await loop.run_in_executor(
+            return await loop.run_in_executor(
                 None, lambda: self._cl.user_stories(user_id)
             )
-            return stories
         except LoginRequired:
             log.warning("[IG] Se requiere login para obtener Stories.")
             self._logged_in = False
@@ -239,47 +274,36 @@ class InstagramClient:
 
     @property
     def is_authenticated(self) -> bool:
-        """Indica si el cliente tiene una sesión activa."""
+        """Indica si el cliente tiene una sesión activa en Instagram."""
         return self._logged_in
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Constructor de embeds premium — estilo TweetShift / REALITY
+# Funciones auxiliares para construir embeds premium
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _separar_caption(raw: str) -> tuple[str, list[str]]:
     """
     Separa el caption de Instagram en texto limpio y lista de hashtags.
 
-    Retorna:
-        (texto_sin_hashtags, [lista_de_hashtags])
-
-    El texto limpio se usa en el cuerpo del embed; los hashtags se muestran
-    como enlaces clicables al final de la descripción.
+    Retorna (texto_sin_hashtags, [lista_de_hashtags]).
+    El texto limpio se muestra en el cuerpo; los hashtags como enlaces al final.
     """
-    palabras = raw.strip().split()
     texto: list[str] = []
     tags: list[str] = []
-
-    for palabra in palabras:
+    for palabra in raw.strip().split():
         if palabra.startswith("#"):
-            # Separar hashtags del texto principal
             tags.append(palabra)
         else:
             texto.append(palabra)
-
-    caption_limpio = " ".join(texto).strip()
-    return caption_limpio, tags
+    return " ".join(texto).strip(), tags
 
 
 def _formatear_numero(n: int) -> str:
     """
-    Formatea un número grande en formato compacto K/M.
+    Formatea un número en formato compacto K/M para las estadísticas.
 
-    Ejemplos:
-        1234    → "1.2K"
-        1500000 → "1.5M"
-        999     → "999"
+    Ejemplos: 1234 → "1.2K" | 1500000 → "1.5M" | 999 → "999"
     """
     if n >= 1_000_000:
         return f"{n / 1_000_000:.1f}M"
@@ -288,392 +312,345 @@ def _formatear_numero(n: int) -> str:
     return str(n)
 
 
-def _construir_linea_stats(media: Media) -> str:
+def _construir_linea_stats(media: object) -> str:
     """
-    Genera la línea de estadísticas del embed en una sola línea compacta.
+    Genera la línea de estadísticas en una sola línea compacta con formato K/M.
 
-    Formato: ❤️ 1.2K  •  💬 56  •  👁️ 12K
+    Ejemplo de salida: ❤️ 1.2K  •  💬 56  •  👁️ 12K
 
-    Las estadísticas se formatean en K/M para mayor legibilidad.
-    Solo se muestran las métricas disponibles (no todas las publicaciones tienen vistas).
+    Solo se incluyen las métricas disponibles (las vistas son solo para Reels).
     """
     partes: list[str] = []
 
-    # Likes (corazones)
     likes = getattr(media, "like_count", 0) or 0
     if likes:
         partes.append(f"❤️ {_formatear_numero(likes)}")
 
-    # Comentarios
     comentarios = getattr(media, "comment_count", 0) or 0
     if comentarios:
         partes.append(f"💬 {_formatear_numero(comentarios)}")
 
-    # Vistas — disponibles principalmente en Reels y videos
+    # Las vistas aplican principalmente a Reels y videos
     vistas = getattr(media, "view_count", 0) or 0
     if vistas:
         partes.append(f"👁️ {_formatear_numero(vistas)}")
 
-    # Separar con bullet point para una sola línea limpia
     return "  •  ".join(partes)
 
 
-def build_media_embed(media: Media, user_info: Optional[UserShort] = None) -> discord.Embed:
+def build_media_embed(media: object, user_info: Optional[object] = None) -> discord.Embed:
     """
     Construye un embed premium de Discord para una publicación de Instagram.
 
-    Diseño del embed (estilo TweetShift/REALITY):
-    ───────────────────────────────────────────────
-    Author  : 📸 foto de perfil + "@username"
-    Title   : "📸 Nueva publicación de @username" (o 🎥 Reel, 📖 Story)
-    URL     : enlace directo a la publicación
-    Descripción:
-        · Caption limpio (sin hashtags)
-        · Línea de stats: ❤️ Likes  •  💬 Comentarios  •  👁️ Vistas
-        · Hashtags clicables al final (máximo 8)
-    Image   : imagen/thumbnail prominente
-    Color   : rosa Instagram #E1306C (borde izquierdo)
-    Footer  : "InstaShift • Instagram • hora actual"
+    Diseño (estilo TweetShift/REALITY):
+    ────────────────────────────────────────
+    Author  : foto de perfil + "@username"
+    Title   : "📸 Nueva publicación de @username"
+    Descripción: caption limpio + stats + hashtags clicables
+    Image   : imagen/thumbnail de la publicación
+    Color   : rosa Instagram #E1306C
+    Footer  : "InstaShift • Instagram • HH:MM UTC"
     """
-    # ── URL de la publicación ─────────────────────────────────────────────────────────────────────────────
-    shortcode = getattr(media, "code", None) or str(media.pk)
+    # URL de la publicación en Instagram
+    shortcode = getattr(media, "code", None) or str(getattr(media, "pk", ""))
     ig_url = f"https://www.instagram.com/p/{shortcode}/"
 
-    # ── Tipo de contenido (Post / Reel / Story) ───────────────────────────────────────────
+    # Determinar tipo de contenido
     media_type = getattr(media, "media_type", 1)
     if media_type == 2:
-        # Tipo 2 = video/reel en la API de Instagram
-        tipo = "🎥 Reel"
+        tipo_emoji = "🎥"
+        tipo_texto = "Reel"
     elif getattr(media, "is_story", False):
-        tipo = "📖 Story"
+        tipo_emoji = "📖"
+        tipo_texto = "Story"
     else:
-        # Tipo 1 = imagen estándar (post normal o carrusel)
-        tipo = "📸 Publicación"
+        tipo_emoji = "📸"
+        tipo_texto = "Publicación"
 
-    # ── Username para el título ──────────────────────────────────────────────────────────────────────
+    # Título: incluir el @usuario si está disponible
     username_display = ""
     if user_info:
         username_display = getattr(user_info, "username", "") or ""
+    titulo = (
+        f"{tipo_emoji} Nueva {tipo_texto.lower()} de @{username_display}"
+        if username_display
+        else f"{tipo_emoji} Nueva {tipo_texto.lower()} de Instagram"
+    )
 
-    # Título claro con tipo y cuenta — estilo "Nueva publicación de @usuario"
-    if username_display:
-        titulo = f"{tipo.split()[0]} Nueva publicación de @{username_display}"
-    else:
-        titulo = f"{tipo} — Nueva publicación"
-
-    # ── Procesar caption: separar texto de hashtags ───────────────────────────────────────────
+    # Separar caption de hashtags
     raw_caption = getattr(media, "caption_text", "") or ""
     caption_limpio, todos_los_tags = _separar_caption(raw_caption)
-
-    # Truncar caption para dejar espacio a estadísticas y hashtags
     if len(caption_limpio) > 1500:
         caption_limpio = caption_limpio[:1497] + "…"
 
-    # ── Línea de estadísticas (❤️ • 💬 • 👁️) ──────────────────────────────────────────────
+    # Línea de estadísticas: ❤️ Likes • 💬 Comentarios • 👁️ Vistas
     linea_stats = _construir_linea_stats(media)
 
-    # ── Hashtags clicables (máximo MAX_HASHTAGS) ────────────────────────────────────────────
-    # Limitamos a 8 para no saturar el embed
+    # Hashtags clicables al final (máximo MAX_HASHTAGS)
     tags_display = todos_los_tags[:MAX_HASHTAGS]
     hashtags_clicables = ""
-
     if tags_display:
-        # Cada hashtag enlaza al explorador de hashtags de Instagram
         hashtags_clicables = "  ".join(
             f"[{t}](https://www.instagram.com/explore/tags/{t.lstrip('#')}/)"
             for t in tags_display
         )
-        # Indicar cuántos hashtags adicionales fueron omitidos
         if len(todos_los_tags) > MAX_HASHTAGS:
             hashtags_clicables += f"  *+{len(todos_los_tags) - MAX_HASHTAGS} más*"
 
-    # ── Armar descripción completa del embed ────────────────────────────────────────────────
-    # Orden: caption → estadísticas → hashtags clicables
+    # Armar descripción: caption → stats → hashtags
     partes_desc: list[str] = []
     if caption_limpio:
         partes_desc.append(caption_limpio)
     if linea_stats:
-        # Línea de stats separada con salto de línea
         partes_desc.append(f"\n{linea_stats}")
     if hashtags_clicables:
-        # Hashtags separados del resto para mayor claridad visual
         partes_desc.append(f"\n\n{hashtags_clicables}")
-
-    # Discord limita la descripción a 4096 caracteres
     descripcion_final = "".join(partes_desc)[:4096]
 
-    # ── Construir el embed con color rosa Instagram ───────────────────────────────────────────
+    # Construir el embed con color rosa Instagram #E1306C
     embed = discord.Embed(
         title=titulo,
         description=descripcion_final or None,
         url=ig_url,
-        color=IG_COLOR,  # Rosa Instagram #E1306C — borde izquierdo del embed
+        color=IG_COLOR,
         timestamp=getattr(media, "taken_at", None),
     )
 
-    # ── Author icon: foto de perfil como icono pequeño ────────────────────────────────────────────
+    # Author: foto de perfil como icono circular junto al nombre
     if user_info:
-        username = getattr(user_info, "username", "instagram")
-        nombre_completo = getattr(user_info, "full_name", "") or f"@{username}"
+        uname = getattr(user_info, "username", "instagram")
+        nombre_completo = getattr(user_info, "full_name", "") or ""
         avatar_url = str(getattr(user_info, "profile_pic_url", "") or "")
 
-        # Mostrar nombre completo si es diferente al username
-        nombre_author = (
-            f"@{username}  •  {nombre_completo}"
-            if nombre_completo != f"@{username}"
-            else f"@{username}"
-        )
+        nombre_author = f"@{uname}  •  {nombre_completo}" if nombre_completo else f"@{uname}"
 
+        # CORRECCION: discord.Embed.Empty fue eliminado en discord.py 2.0
+        # Usar None o simplemente omitir icon_url cuando no hay avatar
         embed.set_author(
             name=nombre_author,
-            url=f"https://www.instagram.com/{username}/",
-            # La foto de perfil aparece como icono circular junto al nombre
-            icon_url=avatar_url if avatar_url else discord.Embed.Empty,
+            url=f"https://www.instagram.com/{uname}/",
+            icon_url=avatar_url or None,
         )
 
-    # ── Imagen grande prominente (la foto de la publicación) ────────────────────────────────
+    # Imagen grande prominente de la publicación
     thumbnail_url: str = ""
 
-    # Prioridad 1: thumbnail_url — disponible en reels y algunos posts
+    # Prioridad 1: thumbnail_url (reels y algunos posts)
     if hasattr(media, "thumbnail_url") and media.thumbnail_url:
         thumbnail_url = str(media.thumbnail_url)
 
-    # Prioridad 2: image_versions2 — lista de candidatos, tomar mayor resolución
+    # Prioridad 2: image_versions2 (lista de candidatos, el primero es mayor resolución)
     if not thumbnail_url and hasattr(media, "image_versions2") and media.image_versions2:
         candidates = media.image_versions2.get("candidates", [])
         if candidates:
-            # El primer candidato suele ser el de mayor resolución
             thumbnail_url = str(candidates[0].get("url", ""))
 
-    # Prioridad 3: resources del carrusel — primera imagen del álbum
+    # Prioridad 3: resources del carrusel (primera imagen del álbum)
     if not thumbnail_url and hasattr(media, "resources") and media.resources:
         first_res = media.resources[0]
         if hasattr(first_res, "thumbnail_url") and first_res.thumbnail_url:
             thumbnail_url = str(first_res.thumbnail_url)
 
-    # Establecer la imagen grande del embed
     if thumbnail_url:
         embed.set_image(url=thumbnail_url)
 
-    # ── Footer limpio: marca + hora actual ────────────────────────────────────────────────────────
-    # Formato: "InstaShift • Instagram • HH:MM UTC"
+    # Footer limpio: marca + hora actual UTC
     hora_actual = datetime.now(timezone.utc).strftime("%H:%M UTC")
     embed.set_footer(text=f"InstaShift  •  Instagram  •  {hora_actual}")
 
     return embed
 
 
-def build_view(media: Media) -> discord.ui.View:
+def build_view(media: object) -> discord.ui.View:
     """
-    Crea una vista con el botón "Ver en Instagram".
-
-    El botón usa estilo link (URL) — es el único estilo permitido por Discord
-    para botones con URL externas. Se muestra visible y clicable en el mensaje.
+    Crea la vista con el botón "Ver en Instagram".
 
     IMPORTANTE: Los botones con url= DEBEN usar ButtonStyle.link.
-    No se puede combinar url= con ButtonStyle.primary u otros estilos de color.
+    Discord no permite combinar url= con ButtonStyle.primary ni otros estilos de color.
+    El botón aparecerá visible y clicable en el mensaje de Discord.
     """
-    shortcode = getattr(media, "code", None) or str(media.pk)
+    shortcode = getattr(media, "code", None) or str(getattr(media, "pk", ""))
     ig_url = f"https://www.instagram.com/p/{shortcode}/"
 
-    # Crear vista persistente (timeout=None = no expira nunca)
     view = discord.ui.View(timeout=None)
-
-    # Botón "Ver en Instagram" — visible, real y clicable
-    # Enlaza directamente a la publicación en Instagram
     view.add_item(
         discord.ui.Button(
             label="Ver en Instagram",
             emoji="📸",
             url=ig_url,
-            # NOTA: ButtonStyle.link es OBLIGATORIO cuando se especifica url=
-            # Discord no permite combinar url= con estilos de color (primary, etc.)
-            style=discord.ButtonStyle.link,
+            style=discord.ButtonStyle.link,  # OBLIGATORIO con url=
         )
     )
     return view
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Cog principal del scraper
+# Cog principal del scraper de Instagram
 # ══════════════════════════════════════════════════════════════════════════════
 
 class InstagramScraperCog(commands.Cog, name="Instagram"):
     """
     Cog que gestiona el scraping de Instagram y los comandos relacionados.
 
-    Funciones principales:
-    - FeedLoop: tarea periódica que comprueba feeds y publica en Discord
-    - /preview: previsualiza la última publicación de cualquier cuenta
+    El nombre "Instagram" es importante: feeds.py lo busca con bot.cogs.get("Instagram")
+    para ejecutar /checknow. No cambiar este nombre.
+
+    Comandos registrados:
+    - /preview         : previsualiza la última publicación de una cuenta
     - /instagram_status: muestra el estado de la sesión de Instagram
     """
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
-        # Instancia del cliente de Instagram (gestiona sesión y scraping)
+        log.info("[Scraper] ⏳ Inicializando cog Instagram...")
+
+        # Instancia del cliente de Instagram
         self.ig = InstagramClient()
-        # Flag para el primer ciclo — evita publicar todo el historial al arrancar
+
+        # Flag anti-spam: en el primer ciclo se marcan sin publicar
         self._primer_ciclo: bool = True
+
         # Iniciar el loop de feeds automáticamente al cargar el cog
         self.feed_loop.start()
+        log.info("[Scraper] ✅ Cog Instagram cargado. FeedLoop iniciado (intervalo=%d min).", CHECK_INTERVAL)
 
     def cog_unload(self) -> None:
         """
         Se llama cuando el cog se descarga (bot cerrando o reload).
-        Cancela el task loop para evitar memory leaks y tareas huérfanas.
+        Cancela el task loop para evitar memory leaks.
         """
         self.feed_loop.cancel()
+        log.info("[Scraper] Cog Instagram descargado. FeedLoop cancelado.")
 
-    # ── Task loop principal ─────────────────────────────────────────────────────────────────────────────
+    # ── Task loop principal ─────────────────────────────────────────────────────────────────────────
 
     @tasks.loop(minutes=CHECK_INTERVAL)
     async def feed_loop(self) -> None:
         """
         Tarea periódica que se ejecuta cada CHECK_INTERVAL minutos.
 
-        Para cada feed activo:
-        1. Obtiene las últimas publicaciones de Instagram
-        2. Filtra las ya publicadas (anti-duplicados)
-        3. En el primer ciclo solo marca sin publicar (anti-spam)
-        4. Publica las nuevas en el canal de Discord configurado
+        Ciclo de trabajo:
+        1. Obtiene todos los feeds activos de la BD
+        2. Asegura sesión de Instagram activa
+        3. Para cada feed: obtiene medias nuevas y las publica en Discord
+        4. En el primer ciclo solo marca (anti-spam) sin publicar
         """
-        # Obtener todos los feeds activos de la base de datos
         feeds = await get_all_active_feeds()
         if not feeds:
-            # Sin feeds configurados — nada que hacer
-            return
+            return  # Sin feeds configurados, nada que hacer
 
-        # Asegurar sesión de Instagram activa antes de scrapear
+        log.debug("[FeedLoop] Verificando %d feed(s)...", len(feeds))
         await self.ig.ensure_logged_in()
 
-        # Procesar cada feed por separado
         for feed in feeds:
             try:
                 await self._procesar_feed(feed)
             except Exception as exc:
                 log.exception(
-                    "[Feed %d] Error inesperado para @%s: %s",
-                    feed["id"],
-                    feed["instagram_account"],
-                    exc,
+                    "[FeedLoop] Error inesperado en feed #%d (@%s): %s",
+                    feed["id"], feed["instagram_account"], exc,
                 )
 
-        # Marcar que el primer ciclo ya terminó (anti-spam activo a partir de ahora)
+        # Completar el primer ciclo (a partir de ahora sí se publican)
         if self._primer_ciclo:
             self._primer_ciclo = False
-            log.info("[FeedLoop] Primer ciclo completado – anti-spam activo.")
+            log.info("[FeedLoop] ✅ Primer ciclo completado. Anti-spam activo a partir de ahora.")
 
     @feed_loop.before_loop
     async def before_feed_loop(self) -> None:
-        """
-        Hook que se ejecuta antes de que inicie el loop.
-        Espera a que el bot esté completamente conectado y listo.
-        """
+        """Espera a que el bot esté completamente conectado antes de iniciar."""
         await self.bot.wait_until_ready()
-        log.info("[FeedLoop] Iniciado (intervalo=%d min).", CHECK_INTERVAL)
+        log.info("[FeedLoop] ▶️ Bot listo. Iniciando loop de feeds (intervalo=%d min).", CHECK_INTERVAL)
+
+    @feed_loop.error
+    async def feed_loop_error(self, exc: Exception) -> None:
+        """Captura errores del loop para que no se detenga silenciosamente."""
+        log.exception("[FeedLoop] ❌ Error en el loop principal: %s", exc)
+
+    # ── Procesamiento de feeds ───────────────────────────────────────────────────────────────────
 
     async def _procesar_feed(self, feed: dict) -> None:
         """
         Procesa un feed individual: obtiene publicaciones nuevas y las envía a Discord.
 
-        Lógica anti-duplicados
-        ----------------------
-        1. En el primer ciclo: marcar TODAS como vistas sin publicar (evita spam al arrancar).
-        2. En ciclos siguientes: publicar solo las no marcadas en la BD.
-
-        Args:
-            feed: dict con campos 'id', 'instagram_account', 'channel_id', etc.
+        Lógica anti-spam y anti-duplicados:
+        1. Primer ciclo: marcar TODAS como vistas sin publicar (evita spam al arrancar).
+        2. Ciclos siguientes: publicar solo las que no están en la BD.
         """
         account: str = feed["instagram_account"]
         feed_id: int = feed["id"]
 
-        # Obtener publicaciones recientes de Instagram
         medias = await self.ig.get_recent_medias(account, amount=MAX_POSTS_PER_CYCLE)
         if not medias:
             return
 
-        # Obtener info del perfil para el embed (foto de perfil, nombre completo)
         user_info = await self.ig.get_user_info(account)
 
-        # Ordenar de más antiguo a más nuevo → publicar en orden cronológico
+        # Ordenar de más antiguo a más nuevo para publicar cronológicamente
         medias.sort(key=lambda m: getattr(m, "taken_at", 0))
 
         for media in medias:
-            media_id = str(media.pk)
+            media_id = str(getattr(media, "pk", ""))
 
-            # ── Verificar si ya fue publicada (anti-duplicados) ────────────────────────────
+            # Anti-duplicados: saltar si ya fue publicada
             if await is_already_posted(feed_id, media_id):
                 continue
 
-            # ── Anti-spam en el primer ciclo ───────────────────────────────────────────────
+            # Anti-spam: primer ciclo solo marca, no publica
             if self._primer_ciclo:
-                # Marcar como vista SIN publicar — evita inundar el canal al arrancar
                 await mark_as_posted(feed_id, media_id)
                 continue
 
-            # ── Determinar canal de destino ──────────────────────────────────────────────────────────────
+            # Obtener canal de destino
             channel_id: int = feed["channel_id"]
             channel = self.bot.get_channel(channel_id)
             if channel is None:
-                log.warning("[Feed %d] Canal %s no encontrado.", feed_id, channel_id)
+                log.warning("[Feed #%d] Canal %s no encontrado. ¿Eliminado?", feed_id, channel_id)
                 continue
 
-            # ── Mención de rol opcional ─────────────────────────────────────────────────────────────────────────
-            # Si el feed tiene configurado un rol para mencionar, se incluye en el contenido
+            # Mención de rol opcional (si está configurado en el feed)
             role_id = feed.get("role_id")
-            contenido: str | None = None
-            if role_id:
-                contenido = f"<@&{role_id}>"
+            contenido: Optional[str] = f"<@&{role_id}>" if role_id else None
 
-            # ── Construir embed y botón de enlace ─────────────────────────────────────────────────────────────
+            # Construir embed premium y botón
             embed = build_media_embed(media, user_info)
             view = build_view(media)
 
-            # ── Publicar en Discord ─────────────────────────────────────────────────────────────────────────────────
             try:
                 await channel.send(content=contenido, embed=embed, view=view)
-                # Registrar en BD para anti-duplicados
                 await mark_as_posted(feed_id, media_id)
                 await update_last_media_id(feed_id, media_id)
-                log.info(
-                    "[Feed %d] Publicado: media %s de @%s",
-                    feed_id, media_id, account,
-                )
+                log.info("[Feed #%d] ✅ Publicado media %s de @%s", feed_id, media_id, account)
             except discord.Forbidden:
-                log.error(
-                    "[Feed %d] Sin permisos para enviar al canal %s.",
-                    feed_id, channel_id,
-                )
+                log.error("[Feed #%d] ❌ Sin permisos en canal %s.", feed_id, channel_id)
             except discord.HTTPException as exc:
-                log.error("[Feed %d] Error HTTP de Discord: %s", feed_id, exc)
+                log.error("[Feed #%d] ❌ Error HTTP de Discord: %s", feed_id, exc)
 
-    # ── Comando /preview ───────────────────────────────────────────────────────────────────────────────
+    # ── Comando /preview ───────────────────────────────────────────────────────────────────────────
 
     @app_commands.command(
         name="preview",
         description="Previsualiza la última publicación de cualquier cuenta pública de Instagram.",
     )
-    @app_commands.describe(username="Usuario de Instagram (sin @)")
+    @app_commands.describe(username="Usuario de Instagram (ej: natgeo) sin el @")
     @app_commands.checks.cooldown(rate=1, per=15.0)
-    async def preview(
-        self, interaction: discord.Interaction, username: str
-    ) -> None:
-        """Muestra la publicación más reciente de una cuenta sin necesidad de suscripción."""
-        # Diferir para evitar timeout mientras se hace el scraping
+    async def preview(self, interaction: discord.Interaction, username: str) -> None:
+        """Muestra la publicación más reciente sin necesidad de suscripción."""
         await interaction.response.defer(thinking=True)
 
-        # Limpiar el username (quitar @ si viene con él)
         username = username.lstrip("@").strip()
         if not username:
+            await interaction.followup.send("❌ Ingresa un nombre de usuario válido.", ephemeral=True)
+            return
+
+        if not INSTAGRAPI_OK:
             await interaction.followup.send(
-                "❌ Por favor ingresa un nombre de usuario válido.", ephemeral=True
+                "❌ El módulo de Instagram no está disponible. Contacta al administrador.",
+                ephemeral=True,
             )
             return
 
-        # Asegurar sesión activa antes de scrapear
         await self.ig.ensure_logged_in()
-
-        # Obtener la publicación más reciente
         medias = await self.ig.get_recent_medias(username, amount=1)
         if not medias:
             await interaction.followup.send(
@@ -683,79 +660,83 @@ class InstagramScraperCog(commands.Cog, name="Instagram"):
             )
             return
 
-        # Obtener info del perfil para el embed
         user_info = await self.ig.get_user_info(username)
-        media = medias[0]
-
-        # Construir embed premium y botón de enlace
-        embed = build_media_embed(media, user_info)
-        view = build_view(media)
-
+        embed = build_media_embed(medias[0], user_info)
+        view = build_view(medias[0])
         await interaction.followup.send(embed=embed, view=view)
 
     @preview.error
-    async def preview_error(
-        self, interaction: discord.Interaction, error: app_commands.AppCommandError
-    ) -> None:
-        """Manejo de errores para el comando /preview."""
+    async def preview_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
+        """Manejo de errores del comando /preview."""
         if isinstance(error, app_commands.CommandOnCooldown):
             await interaction.response.send_message(
-                f"⏳ Comando en cooldown. Intenta de nuevo en {error.retry_after:.1f}s.",
-                ephemeral=True,
+                f"⏳ Cooldown activo. Intenta en {error.retry_after:.1f}s.", ephemeral=True
             )
 
-    # ── Comando /instagram_status ──────────────────────────────────────────────────────────────────────────
+    # ── Comando /instagram_status ────────────────────────────────────────────────────────────────
 
     @app_commands.command(
         name="instagram_status",
-        description="Muestra el estado actual de la sesión de Instagram.",
+        description="Muestra el estado de la sesión de Instagram del bot.",
     )
     @app_commands.checks.has_permissions(manage_guild=True)
     async def instagram_status(self, interaction: discord.Interaction) -> None:
         """
-        Informa si el bot está autenticado en Instagram o en modo invitado.
-        Requiere permiso de 'Gestionar servidor'.
+        Informa si el bot está autenticado en Instagram, en modo invitado,
+        o si instagrapi no está disponible. Requiere permiso Gestionar Servidor.
         """
         await interaction.response.defer(ephemeral=True)
 
-        # Verificar estado de autenticación
+        if not INSTAGRAPI_OK:
+            embed = discord.Embed(
+                title="❌ instagrapi no disponible",
+                description=(
+                    "La librería **instagrapi** no está instalada o tiene un error.\n"
+                    "Revisa los logs del bot para más detalles."
+                ),
+                color=0xFF0000,
+            )
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            return
+
         is_auth = await self.ig.ensure_logged_in()
 
         if is_auth:
-            # ── Sesión activa ──────────────────────────────────────────────────────────────────────────────
             embed = discord.Embed(
-                title="✅ Instagram — Sesión activa",
+                title="✅ Sesión de Instagram activa",
                 description=f"Autenticado como **@{IG_USERNAME}**",
-                color=0x00B347,  # Verde de éxito
+                color=0x00B347,
             )
-            embed.add_field(
-                name="Archivo de sesión",
-                value=f"`{SESSION_PATH}`",
-                inline=False,
-            )
+            embed.add_field(name="Archivo de sesión", value=f"`{SESSION_PATH}`", inline=False)
+            embed.add_field(name="Intervalo de scraping", value=f"{CHECK_INTERVAL} minutos", inline=True)
         else:
-            # ── Sin sesión / modo invitado ───────────────────────────────────────────────────────────────────
             embed = discord.Embed(
-                title="⚠️ Instagram — Modo invitado",
+                title="⚠️ Modo invitado (sin credenciales)",
                 description=(
                     "No hay credenciales configuradas.\n"
-                    "Establece **IG_USERNAME** e **IG_PASSWORD** en tu archivo `.env`."
+                    "Establece **IG_USERNAME** e **IG_PASSWORD** en las variables de entorno."
                 ),
-                color=0xFFA500,  # Naranja de advertencia
+                color=0xFFA500,
             )
-            embed.set_footer(text="El modo invitado tiene acceso muy limitado.")
+            embed.set_footer(text="El modo invitado tiene acceso muy limitado a la API.")
 
         await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-# ── Función requerida por discord.py para cargar el cog ───────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────────
+# Función setup() — OBLIGATORIA para load_extension()
+# ─────────────────────────────────────────────────────────────────────────────────
 
 async def setup(bot: commands.Bot) -> None:
     """
-    Registra el cog en el bot.
+    Registra el cog Instagram en el bot.
 
-    Esta función ES OBLIGATORIA y debe llamarse 'setup'.
-    discord.py la llama automáticamente cuando se ejecuta load_extension().
-    Sin esta función, el cog NO se carga y los comandos NO se sincronizan.
+    discord.py llama a esta función automáticamente al ejecutar load_extension().
+    SIN esta función el cog NO se carga y los comandos NO aparecen en Discord.
+
+    Nota: Si instagrapi no está instalado, el cog se carga igualmente
+    pero el scraper no funcionará. Los logs mostrarán un error crítico.
     """
+    log.info("[Setup] Registrando cog Instagram en el bot...")
     await bot.add_cog(InstagramScraperCog(bot))
+    log.info("[Setup] ✅ Cog Instagram registrado correctamente.")
