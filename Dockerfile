@@ -33,8 +33,7 @@ COPY --from=builder /install /usr/local
 # Copy source code
 COPY bot/ ./bot/
 
-# Persistent data volumes (db + session)
-VOLUME ["/app/data"]
+# ⚠️ LÍNEA ELIMINADA: VOLUME ["/app/data"]  <-- ESTO YA NO DEBE ESTAR
 
 # Non-root user for security
 RUN addgroup --system botuser && adduser --system --ingroup botuser botuser
