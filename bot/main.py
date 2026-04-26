@@ -1,11 +1,11 @@
 """
 main.py – InstaShift
 ====================
-Bot entry-point.  Loads cogs, initialises the database and starts the bot.
+Punto de entrada del bot. Carga los cogs, inicializa la base de datos
+y conecta el bot a Discord.
 
-Run via:
+Uso:
     python -m bot.main
-or:
     bash run.sh
 """
 
@@ -23,109 +23,126 @@ from dotenv import load_dotenv
 
 from bot.database import init_db
 
-# ── Load environment ──────────────────────────────────────────────────────────
+# ── Cargar variables de entorno desde .env ────────────────────────────────────
 load_dotenv()
 
-# ── Logging configuration ─────────────────────────────────────────────────────
+# ── Configuración de logging ──────────────────────────────────────────────────
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s [%(levelname)-8s] %(name)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-    ],
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
 log = logging.getLogger("instashift")
 
-# ── Constants ─────────────────────────────────────────────────────────────────
+# ── Constantes de configuración ───────────────────────────────────────────────
 DISCORD_TOKEN: str = os.getenv("DISCORD_TOKEN", "")
+
+# Si GUILD_ID está definido, los comandos se sincronizan solo en ese servidor
+# (ideal para desarrollo: instantáneo). En producción déjalo vacío.
 GUILD_ID_RAW: str = os.getenv("GUILD_ID", "")
 TEST_GUILD: discord.Object | None = (
     discord.Object(id=int(GUILD_ID_RAW)) if GUILD_ID_RAW.strip() else None
 )
 
-# Cogs to load on startup
+# Lista de extensiones (cogs) a cargar al iniciar el bot
 EXTENSIONS: list[str] = [
-    "bot.cogs.instagram_scraper",
-    "bot.cogs.feeds",
+    "bot.cogs.instagram_scraper",  # Scraper + /preview + /instagram_status
+    "bot.cogs.feeds",              # /follow /unfollow /list /dashboard /checknow /sync
 ]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Bot class
+# Clase principal del bot
 # ══════════════════════════════════════════════════════════════════════════════
 
 class InstaShift(commands.Bot):
-    """Custom Bot subclass with async setup."""
+    """Bot personalizado con setup asíncrono y manejo de ciclo de vida."""
 
     def __init__(self) -> None:
+        # Configurar intents mínimos necesarios
         intents = discord.Intents.default()
         intents.guilds = True
         intents.guild_messages = True
 
         super().__init__(
-            command_prefix=commands.when_mentioned,  # prefix unused (slash-only)
+            command_prefix=commands.when_mentioned,  # Solo slash commands (sin prefijo clásico)
             intents=intents,
             help_command=None,
-            description="📸 Mirror Instagram feeds to Discord channels.",
+            description="📸 Espeja feeds de Instagram en canales de Discord.",
         )
 
-    # ── Lifecycle ─────────────────────────────────────────────────────────────
+    # ── Ciclo de vida ─────────────────────────────────────────────────────────
 
     async def setup_hook(self) -> None:
-        """Called once before the bot connects to Discord."""
-        # Initialise database
+        """
+        Se ejecuta una vez antes de conectar a Discord.
+        Inicializa la BD y carga todas las extensiones.
+        """
+        # Inicializar la base de datos SQLite
         await init_db()
-        log.info("Database initialised.")
+        log.info("Base de datos inicializada correctamente.")
 
-        # Load cogs
+        # Cargar cada cog (módulo de comandos)
         for ext in EXTENSIONS:
             try:
                 await self.load_extension(ext)
-                log.info("Loaded extension: %s", ext)
+                log.info("Extensión cargada: %s", ext)
             except Exception as exc:
-                log.exception("Failed to load extension %s: %s", ext, exc)
+                log.exception("Error al cargar la extensión %s: %s", ext, exc)
 
-        # Sync slash commands
+        # Sincronizar comandos slash
         if TEST_GUILD:
-            # Instant sync to a single guild (dev mode)
+            # Modo desarrollo: sync instantáneo a un servidor específico
             self.tree.copy_global_to(guild=TEST_GUILD)
             synced = await self.tree.sync(guild=TEST_GUILD)
-            log.info("Slash commands synced to guild %s (%d commands)", TEST_GUILD.id, len(synced))
+            log.info(
+                "Comandos sincronizados en el servidor de desarrollo %s (%d comandos)",
+                TEST_GUILD.id, len(synced),
+            )
         else:
-            # Global sync (may take up to 1 hour to propagate)
+            # Modo producción: sync global (puede tardar hasta 1 hora en propagarse)
             synced = await self.tree.sync()
-            log.info("Slash commands synced globally (%d commands)", len(synced))
+            log.info("Comandos sincronizados globalmente (%d comandos)", len(synced))
 
     async def on_ready(self) -> None:
+        """Se ejecuta cuando el bot está conectado y listo."""
         log.info("=" * 55)
-        log.info("  InstaShift is online!")
-        log.info("  Logged in as : %s (ID: %s)", self.user, self.user.id)
-        log.info("  Guild count  : %d", len(self.guilds))
-        log.info("  discord.py   : %s", discord.__version__)
+        log.info("  InstaShift está en línea!")
+        log.info("  Usuario    : %s (ID: %s)", self.user, self.user.id)
+        log.info("  Servidores : %d", len(self.guilds))
+        log.info("  discord.py : %s", discord.__version__)
         log.info("=" * 55)
+
+        # Establecer presencia del bot
         await self.change_presence(
             activity=discord.Activity(
                 type=discord.ActivityType.watching,
-                name="Instagram feeds 📸",
+                name="feeds de Instagram 📸",
             )
         )
 
     async def on_guild_join(self, guild: discord.Guild) -> None:
-        log.info("Joined guild: %s (ID: %s)", guild.name, guild.id)
+        """Log cuando el bot ingresa a un nuevo servidor."""
+        log.info("Ingresé al servidor: %s (ID: %s)", guild.name, guild.id)
 
     async def on_guild_remove(self, guild: discord.Guild) -> None:
-        log.info("Left guild: %s (ID: %s)", guild.name, guild.id)
+        """Log cuando el bot es removido de un servidor."""
+        log.info("Fui removido del servidor: %s (ID: %s)", guild.name, guild.id)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Entry-point
+# Punto de entrada principal
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def main() -> None:
+    """Función principal que inicia el bot."""
     if not DISCORD_TOKEN:
-        log.critical("DISCORD_TOKEN is not set. Please configure your .env file.")
+        log.critical(
+            "DISCORD_TOKEN no está configurado. "
+            "Por favor completa tu archivo .env con el token del bot."
+        )
         sys.exit(1)
 
     async with InstaShift() as bot:
@@ -136,4 +153,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        log.info("Bot stopped by user (KeyboardInterrupt).")
+        log.info("Bot detenido por el usuario (KeyboardInterrupt).")
