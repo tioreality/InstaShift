@@ -74,14 +74,35 @@ from bot.database import (
 # ── Logger del módulo ─────────────────────────────────────────────────────────────────────────────
 log = logging.getLogger(__name__)
 
-# ── Variables de entorno ───────────────────────────────────────────────────────────────────────
-IG_USERNAME: str = os.getenv("IG_USERNAME", "")
-IG_PASSWORD: str = os.getenv("IG_PASSWORD", "")
-SESSION_PATH: Path = Path(os.getenv("SESSION_PATH", "ig_session.json"))
+# ── Variables de entorno ──────────────────────────────────────────────────────────────────
+# NOTA IMPORTANTE: estas variables se leen aqui (nivel modulo) cuando Python
+# importa el modulo. En Railway las variables del servicio ya estan inyectadas
+# en el entorno del SO antes de que el proceso arranque, por lo que os.getenv()
+# las recoge correctamente sin necesidad de un archivo .env.
+IG_USERNAME: str = os.getenv("IG_USERNAME", "").strip()
+IG_PASSWORD: str = os.getenv("IG_PASSWORD", "").strip()
+SESSION_PATH: Path = Path(os.getenv("SESSION_PATH", "ig_session.json").strip())
 
 # Intervalo de polling en minutos (por defecto cada 10 minutos)
-CHECK_INTERVAL: int = int(os.getenv("CHECK_INTERVAL", "10"))
+CHECK_INTERVAL: int = int(os.getenv("CHECK_INTERVAL", "10").strip() or "10")
 
+# ── Log de credenciales al importar el modulo ─────────────────────────────────────────────
+# Estos logs aparecen cuando el cog se carga (en setup_hook, antes del login).
+# Son la segunda linea de verificacion despues de los logs en main.py.
+if IG_USERNAME:
+    log.info("[ENV] IG_USERNAME cargado correctamente: %s", IG_USERNAME)
+else:
+    log.warning("[ENV] IG_USERNAME NO encontrado o vacio en este modulo.")
+
+if IG_PASSWORD:
+    log.info("[ENV] IG_PASSWORD cargada (%d caracteres)", len(IG_PASSWORD))
+else:
+    log.warning("[ENV] IG_PASSWORD NO encontrada o vacia en este modulo.")
+
+if IG_USERNAME and IG_PASSWORD:
+    log.info("[Login] Credenciales detectadas → Iniciando login al conectar...")
+else:
+    log.warning("[Login] Modo invitado activado (sin credenciales) → funcionalidad limitada.")
 # ── Constantes de diseño ──────────────────────────────────────────────────────────────────────────
 # Color rosa Instagram (#E1306C) — borde izquierdo del embed
 IG_COLOR = 0xE1306C
@@ -150,17 +171,18 @@ class InstagramClient:
 
     async def ensure_logged_in(self) -> bool:
         """
-        Garantiza que el cliente esté autenticado antes de hacer requests.
+        Garantiza que el cliente este autenticado antes de hacer requests.
 
         Flujo:
-        1. Si instagrapi no está disponible → retorna False con log de error.
-        2. Si ya está autenticado → retorna True inmediatamente.
-        3. Si hay sesión guardada válida → la restaura.
-        4. Si no → hace login fresco con usuario/contraseña.
+        1. Si instagrapi no esta disponible → retorna False con log de error.
+        2. Si ya esta autenticado → retorna True inmediatamente.
+        3. Re-lee credenciales del entorno (fix para timing issues en Railway).
+        4. Si hay sesion guardada valida → la restaura.
+        5. Si no → hace login fresco con usuario/contrasena.
         """
-        # Verificar que instagrapi esté disponible
+        # Verificar que instagrapi este disponible
         if not INSTAGRAPI_OK or self._cl is None:
-            log.error("[IG] instagrapi no disponible – no se puede autenticar.")
+            log.error("[IG] instagrapi no disponible - no se puede autenticar.")
             return False
 
         async with self._lock:
@@ -168,41 +190,51 @@ class InstagramClient:
             if self._logged_in:
                 return True
 
+            # Re-leer las variables en tiempo de ejecucion para mayor robustez.
+            # Si por timing issue la variable global quedo vacia al importar el
+            # modulo, se re-lee directamente del entorno en el momento del login.
+            ig_user = IG_USERNAME or os.getenv("IG_USERNAME", "").strip()
+            ig_pass = IG_PASSWORD or os.getenv("IG_PASSWORD", "").strip()
+
             # Sin credenciales → modo invitado (acceso limitado)
-            if not IG_USERNAME or not IG_PASSWORD:
-                log.warning("[IG] Sin credenciales – operando en modo invitado.")
+            if not ig_user or not ig_pass:
+                log.warning(
+                    "[Login] Modo invitado activado (sin credenciales). "
+                    "Configura IG_USERNAME e IG_PASSWORD en Railway."
+                )
                 return False
 
+            log.info("[Login] Credenciales detectadas → Iniciando login como @%s...", ig_user)
             # CORRECCION: usar get_running_loop() en lugar del deprecado get_event_loop()
             loop = asyncio.get_running_loop()
 
-            # 1. Intentar restaurar sesión guardada
+            # 1. Intentar restaurar sesion guardada
             restored = await loop.run_in_executor(None, self._load_session)
             if restored:
+                log.info("[Login] Sesion restaurada desde %s", SESSION_PATH)
                 return True
 
             # 2. Login fresco con credenciales
             try:
-                log.info("[IG] Iniciando sesión como @%s …", IG_USERNAME)
+                log.info("[Login] Iniciando sesion fresca como @%s ...", ig_user)
                 await loop.run_in_executor(
                     None,
-                    lambda: self._cl.login(IG_USERNAME, IG_PASSWORD),
+                    lambda: self._cl.login(ig_user, ig_pass),
                 )
                 self._logged_in = True
                 await loop.run_in_executor(None, self._save_session)
-                log.info("[IG] ✅ Login exitoso como @%s", IG_USERNAME)
+                log.info("[Login] Login exitoso como @%s", ig_user)
                 return True
             except BadPassword:
-                log.error("[IG] ❌ Contraseña incorrecta para @%s. Revisa IG_PASSWORD.", IG_USERNAME)
+                log.error("[Login] Contrasena incorrecta para @%s. Revisa IG_PASSWORD.", ig_user)
             except ChallengeRequired:
-                log.error("[IG] ❌ Se requiere verificación (challenge/2FA). Resuelve manualmente.")
+                log.error("[Login] Se requiere verificacion (challenge/2FA). Resuelve manualmente.")
             except ReloginAttemptExceeded:
-                log.error("[IG] ❌ Demasiados intentos de re-login. Espera antes de reintentar.")
+                log.error("[Login] Demasiados intentos de re-login. Espera antes de reintentar.")
             except Exception as exc:
-                log.exception("[IG] ❌ Error inesperado durante el login: %s", exc)
+                log.exception("[Login] Error inesperado durante el login: %s", exc)
 
             return False
-
     # ── Obtención de datos ────────────────────────────────────────────────────────────────────────
 
     async def get_user_info(self, username: str) -> Optional[object]:
